@@ -27,6 +27,9 @@ const botSpamTracker      = {}; // { guildId: { botId: { count, timer } } }
 const channelDeleteTracker = {}; // { guildId: { botId: timestamp[] } }
 const deletedMessages     = {}; // { guildId: lastDeletedMsg }
 const verifyConfig        = {}; // { guildId: { roleId, channelId } }
+// userSpam: tracks repeated identical messages per user
+// { guildId: { userId: { content, count, timer, messageIds[] } } }
+const userSpamTracker     = {};
 
 // =====================
 // Malicious content regex
@@ -52,9 +55,10 @@ function isWhitelisted(member) {
   return false;
 }
 function initGuild(guildId) {
-  if (!whitelist[guildId])      whitelist[guildId]      = { users: new Set(), roles: new Set() };
-  if (!warnings[guildId])       warnings[guildId]       = {};
+  if (!whitelist[guildId])       whitelist[guildId]       = { users: new Set(), roles: new Set() };
+  if (!warnings[guildId])        warnings[guildId]        = {};
   if (!deletedMessages[guildId]) deletedMessages[guildId] = null;
+  if (!userSpamTracker[guildId]) userSpamTracker[guildId] = {};
 }
 async function sendLog(guild, embed) {
   const ch = getLogChannel(guild);
@@ -261,6 +265,80 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
   const isAdmin       = message.member?.permissions.has(PermissionsBitField.Flags.Administrator);
+  const isMod         = message.member?.permissions.has(PermissionsBitField.Flags.ManageMessages);
+  const isServerOwner = isOwner(message.member);
+  const whitelisted   = isWhitelisted(message.member);
+
+  // ---- Repeated message spam detection ----
+  if (!isAdmin && !isMod && !whitelisted) {
+    const uid     = message.author.id;
+    const content = message.content.trim().toLowerCase();
+    if (!userSpamTracker[guild.id][uid]) {
+      userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
+    }
+    const tracker = userSpamTracker[guild.id][uid];
+
+    if (content && content === tracker.content) {
+      tracker.count++;
+      tracker.messageIds.push(message.id);
+    } else {
+      // Different message — reset
+      tracker.content    = content;
+      tracker.count      = 1;
+      tracker.messageIds = [message.id];
+    }
+
+    // Reset after 10 seconds of no spam
+    if (tracker.timer) clearTimeout(tracker.timer);
+    tracker.timer = setTimeout(() => {
+      if (userSpamTracker[guild.id]) {
+        userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
+      }
+    }, 10000);
+
+    if (tracker.count >= 5) {
+      // Delete the last 5 spam messages
+      const idsToDelete = tracker.messageIds.slice(-5);
+      for (const id of idsToDelete) {
+        await message.channel.messages.fetch(id)
+          .then(m => m.delete().catch(() => {}))
+          .catch(() => {});
+      }
+
+      // Warn or kick based on existing warnings
+      if (!warnings[guild.id][uid]) warnings[guild.id][uid] = 0;
+      warnings[guild.id][uid]++;
+      const warnCount = warnings[guild.id][uid];
+
+      // Reset spam tracker after action
+      userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
+
+      if (warnCount === 1) {
+        const warn = await message.channel.send(
+          `${message.author.username}, stop spamming. Your repeated messages have been deleted. This is your warning — a second offence will result in a kick.`
+        );
+        setTimeout(() => warn.delete().catch(() => {}), 8000);
+        await sendLog(guild, bwEmbed('Spam Warning')
+          .addFields(
+            { name: 'User',     value: `${message.author.tag}`,    inline: true },
+            { name: 'Channel',  value: `#${message.channel.name}`, inline: true },
+            { name: 'Repeated', value: `"${message.content.slice(0, 80)}"` },
+            { name: 'Deleted',  value: `${idsToDelete.length} message(s)` },
+          ).setTimestamp());
+      } else {
+        if (message.member.kickable) {
+          await message.member.kick('Repeated spam after warning');
+          await sendLog(guild, bwEmbed('Member Kicked — Spam')
+            .addFields(
+              { name: 'User',   value: `${message.author.tag}`, inline: true },
+              { name: 'Reason', value: 'Repeated spam after warning' },
+            ).setTimestamp());
+          warnings[guild.id][uid] = 0;
+        }
+      }
+      return;
+    }
+  }
   const isMod         = message.member?.permissions.has(PermissionsBitField.Flags.ManageMessages);
   const isServerOwner = isOwner(message.member);
   const whitelisted   = isWhitelisted(message.member);
@@ -618,6 +696,81 @@ client.on('messageCreate', async message => {
     const confirm = await message.channel.send(`Cleared ${deleted} message(s).`);
     setTimeout(() => confirm.delete().catch(() => {}), 4000);
   }
+
+  // =====================
+  // +hide #channel — hide a channel from @everyone
+  // +hide #channel @role — hide from everyone except a specific role
+  // =====================
+  if (command === 'hide') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+
+    const target   = message.mentions.channels.first();
+    const role     = message.mentions.roles.first();
+    const everyone = guild.roles.everyone;
+
+    if (!target) return message.reply('Mention a channel. Example: `+hide #channel` or `+hide #channel @role`');
+
+    try {
+      const overwrites = [{ id: everyone, deny: [PermissionsBitField.Flags.ViewChannel] }];
+
+      // If a role is specified, allow that role to still see it
+      if (role) {
+        overwrites.push({ id: role, allow: [PermissionsBitField.Flags.ViewChannel] });
+      }
+
+      await target.permissionOverwrites.set(overwrites);
+
+      const msg = role
+        ? `<#${target.id}> is now hidden from @everyone. Only **${role.name}** can see it.`
+        : `<#${target.id}> is now hidden from @everyone.`;
+
+      const done = await message.channel.send(msg);
+      setTimeout(() => done.delete().catch(() => {}), 6000);
+      await message.delete().catch(() => {});
+
+      await sendLog(guild, bwEmbed('Channel Hidden')
+        .addFields(
+          { name: 'By',             value: message.author.tag,                    inline: true },
+          { name: 'Channel',        value: `#${target.name}`,                     inline: true },
+          { name: 'Visible to',     value: role ? role.name : 'Nobody (admins only)', inline: true },
+        ).setTimestamp());
+    } catch (e) {
+      console.error('Hide error:', e.message);
+      message.reply('Failed to hide that channel. Make sure I have Manage Channels permission and my role is high enough.');
+    }
+    return;
+  }
+
+  // =====================
+  // +unhide #channel — restore a channel back to visible for @everyone
+  // =====================
+  if (command === 'unhide') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+
+    const target   = message.mentions.channels.first();
+    const everyone = guild.roles.everyone;
+
+    if (!target) return message.reply('Mention a channel. Example: `+unhide #channel`');
+
+    try {
+      await target.permissionOverwrites.edit(everyone, { ViewChannel: true });
+
+      const done = await message.channel.send(`<#${target.id}> is now visible to @everyone again.`);
+      setTimeout(() => done.delete().catch(() => {}), 6000);
+      await message.delete().catch(() => {});
+
+      await sendLog(guild, bwEmbed('Channel Unhidden')
+        .addFields(
+          { name: 'By',      value: message.author.tag, inline: true },
+          { name: 'Channel', value: `#${target.name}`,  inline: true },
+        ).setTimestamp());
+    } catch (e) {
+      console.error('Unhide error:', e.message);
+      message.reply('Failed to unhide that channel. Make sure I have Manage Channels permission.');
+    }
+    return;
+  }
+
 });
 
 // =====================
