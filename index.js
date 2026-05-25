@@ -30,6 +30,8 @@ const verifyConfig        = {}; // { guildId: { roleId, channelId } }
 // userSpam: tracks repeated identical messages per user
 // { guildId: { userId: { content, count, timer, messageIds[] } } }
 const userSpamTracker     = {};
+// countdowns: { guildId: { date: Date, label: string } }
+const countdowns          = {};
 
 // =====================
 // Malicious content regex
@@ -388,6 +390,8 @@ client.on('messageCreate', async message => {
         .addFields(
           { name: 'General',
             value: '`+ping`  `+members`  `+userinfo [@user]`  `+serverinfo`  `+grab`' },
+          { name: 'Countdown',
+            value: '`+countdown set YYYY-MM-DD HH:MM label` — set a countdown\n`+countdown` — show current countdown\n`+countdown clear` — remove countdown' },
           { name: 'Moderation',
             value: '`+clear [1-100]`  `+clearall`  `+warnings [@user]`  `+clearwarnings [@user]`' },
           { name: 'Whitelist — Owner/Admin',
@@ -419,6 +423,101 @@ client.on('messageCreate', async message => {
           { name: 'Humans', value: `${humans}`, inline: true },
           { name: 'Bots',   value: `${bots}`,   inline: true },
         ).setTimestamp()
+    ]});
+  }
+
+  // =====================
+  // +countdown — show, set, or clear a countdown
+  // =====================
+  if (command === 'countdown') {
+    const sub = args[0]?.toLowerCase();
+
+    // +countdown clear
+    if (sub === 'clear') {
+      if (!isAdmin) return message.reply('You need Administrator to clear the countdown.');
+      delete countdowns[guild.id];
+      return message.reply('Countdown cleared.');
+    }
+
+    // +countdown set YYYY-MM-DD HH:MM label
+    if (sub === 'set') {
+      if (!isAdmin) return message.reply('You need Administrator to set the countdown.');
+
+      // args: ['set', 'YYYY-MM-DD', 'HH:MM', ...label words]
+      const datePart  = args[1];
+      const timePart  = args[2] || '00:00';
+      const label     = args.slice(3).join(' ') || 'Countdown';
+
+      if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+        return message.reply('Format: `+countdown set YYYY-MM-DD HH:MM Label`\nExample: `+countdown set 2025-12-31 23:59 New Year`');
+      }
+
+      const target = new Date(`${datePart}T${timePart}:00`);
+      if (isNaN(target.getTime())) {
+        return message.reply('Invalid date or time. Use format: `YYYY-MM-DD HH:MM`');
+      }
+      if (target <= new Date()) {
+        return message.reply('That date is already in the past.');
+      }
+
+      countdowns[guild.id] = { date: target, label };
+      const diff   = target - Date.now();
+      const days   = Math.floor(diff / 86400000);
+      const hours  = Math.floor((diff % 86400000) / 3600000);
+      const mins   = Math.floor((diff % 3600000) / 60000);
+
+      return message.reply({ embeds: [
+        bwEmbed(label)
+          .setDescription(`Countdown set. Use \`+countdown\` anytime to check it.`)
+          .addFields(
+            { name: 'Target Date', value: target.toUTCString().replace(' GMT', ' UTC'), inline: false },
+            { name: 'Time Remaining', value: `${days}d ${hours}h ${mins}m`, inline: false },
+          ).setTimestamp()
+      ]});
+    }
+
+    // +countdown — show current
+    const cd = countdowns[guild.id];
+    if (!cd) {
+      return message.reply('No countdown set. Use `+countdown set YYYY-MM-DD HH:MM Label` to set one.');
+    }
+
+    const now  = Date.now();
+    const diff = cd.date - now;
+
+    if (diff <= 0) {
+      delete countdowns[guild.id];
+      return message.reply({ embeds: [
+        bwEmbed(cd.label)
+          .setDescription('The countdown has ended.')
+          .setTimestamp()
+      ]});
+    }
+
+    const days  = Math.floor(diff / 86400000);
+    const hours = Math.floor((diff % 86400000) / 3600000);
+    const mins  = Math.floor((diff % 3600000) / 60000);
+    const secs  = Math.floor((diff % 60000) / 1000);
+
+    // Build a clean visual bar
+    const totalDays    = Math.ceil((cd.date - new Date(cd.date).setHours(0,0,0,0) + diff) / 86400000);
+    const progress     = Math.max(0, Math.min(20, Math.floor((1 - diff / (cd.date - now + diff)) * 20)));
+    const bar          = '█'.repeat(progress) + '░'.repeat(20 - progress);
+
+    return message.reply({ embeds: [
+      new EmbedBuilder()
+        .setColor(0x000000)
+        .setTitle(cd.label)
+        .setDescription(`\`${bar}\``)
+        .addFields(
+          { name: 'Days',    value: `${days}`,  inline: true },
+          { name: 'Hours',   value: `${hours}`, inline: true },
+          { name: 'Minutes', value: `${mins}`,  inline: true },
+          { name: 'Seconds', value: `${secs}`,  inline: true },
+          { name: 'Target',  value: cd.date.toUTCString().replace(' GMT', ' UTC'), inline: false },
+        )
+        .setFooter({ text: 'Run +countdown again to refresh' })
+        .setTimestamp()
     ]});
   }
 
