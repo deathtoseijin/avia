@@ -1,9 +1,11 @@
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, EmbedBuilder,
-  PermissionsBitField, WebhookClient, AuditLogEvent,
-  ButtonBuilder, ButtonStyle, ActionRowBuilder, Events,
+  Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField,
+  WebhookClient, AuditLogEvent, ButtonBuilder, ButtonStyle,
+  ActionRowBuilder, Events, ChannelType, AttachmentBuilder,
 } = require('discord.js');
+const path    = require('path');
+const storage = require('./storage');
 
 const client = new Client({
   intents: [
@@ -18,141 +20,139 @@ const client = new Client({
 
 const PREFIX = '+';
 
-// =====================
-// In-memory storage
-// =====================
-const warnings            = {}; // { guildId: { userId: count } }
-const whitelist           = {}; // { guildId: { users: Set, roles: Set } }
-const botSpamTracker      = {}; // { guildId: { botId: { count, timer } } }
-const channelDeleteTracker = {}; // { guildId: { botId: timestamp[] } }
-const deletedMessages     = {}; // { guildId: lastDeletedMsg }
-const verifyConfig        = {}; // { guildId: { roleId, channelId } }
-// userSpam: tracks repeated identical messages per user
-// { guildId: { userId: { content, count, timer, messageIds[] } } }
-const userSpamTracker     = {};
-// countdowns: { guildId: { date: Date, label: string } }
-const countdowns          = {};
+// ─────────────────────────────────────────
+// Runtime storage (resets on restart — ok for these)
+// ─────────────────────────────────────────
+const warnings             = {};
+const whitelist            = {};
+const botSpamTracker       = {};
+const channelDeleteTracker = {};
+const deletedMessages      = {};
+const userSpamTracker      = {};
+const countdowns           = {};
+const openTickets          = {}; // { channelId: { userId, claimedBy, guildId } }
 
-// =====================
-// Malicious content regex
-// =====================
+// ─────────────────────────────────────────
+// Persistent config (survives restarts)
+// ─────────────────────────────────────────
+// verifyConfig[guildId]  = { roleId }
+// ticketConfig[guildId]  = { supportRoleId, closeRoleId, categoryId, panelChannelId }
+const verifyConfig = storage.get('verifyConfig', {});
+const ticketConfig = storage.get('ticketConfig', {});
+
+function saveVerify() { storage.set('verifyConfig', verifyConfig); }
+function saveTicket() { storage.set('ticketConfig', ticketConfig); }
+
+// ─────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────
 const MALICIOUS_REGEX = /https?:\/\/[^\s]+|discord\.gg\/[^\s]+|www\.[^\s]+|@everyone|@here|\b(free nitro|claim your prize|you (have been|were) selected)\b/gi;
+const BANNER_PATH     = path.join(__dirname, 'banner.png');
 
-// =====================
+// ─────────────────────────────────────────
 // Helpers
-// =====================
-function getLogChannel(guild) {
-  return guild.channels.cache.find(ch => ch.name === 'logs');
-}
-function isOwner(member) {
-  return member.guild.ownerId === member.user.id;
-}
-function isWhitelisted(member) {
+// ─────────────────────────────────────────
+const getLogChannel = guild => guild.channels.cache.find(ch => ch.name === 'logs');
+const isOwner       = member => member.guild.ownerId === member.user.id;
+const isWhitelisted = member => {
   const wl = whitelist[member.guild.id];
   if (!wl) return false;
   if (wl.users.has(member.user.id)) return true;
-  for (const roleId of member.roles.cache.keys()) {
-    if (wl.roles.has(roleId)) return true;
-  }
-  return false;
-}
+  return [...member.roles.cache.keys()].some(id => wl.roles.has(id));
+};
+
 function initGuild(guildId) {
-  if (!whitelist[guildId])       whitelist[guildId]       = { users: new Set(), roles: new Set() };
-  if (!warnings[guildId])        warnings[guildId]        = {};
-  if (!deletedMessages[guildId]) deletedMessages[guildId] = null;
-  if (!userSpamTracker[guildId]) userSpamTracker[guildId] = {};
+  if (!whitelist[guildId])        whitelist[guildId]        = { users: new Set(), roles: new Set() };
+  if (!warnings[guildId])         warnings[guildId]         = {};
+  if (!deletedMessages[guildId])  deletedMessages[guildId]  = null;
+  if (!userSpamTracker[guildId])  userSpamTracker[guildId]  = {};
 }
+
 async function sendLog(guild, embed) {
   const ch = getLogChannel(guild);
   if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
 }
-function bwEmbed(title) {
-  return new EmbedBuilder().setColor(0x000000).setTitle(title);
-}
-function getMemberCount(guild) {
+
+const bw = title => new EmbedBuilder().setColor(0x000000).setTitle(title);
+
+const getMemberCount = guild => {
   const total = guild.memberCount;
   const bots  = guild.members.cache.filter(m => m.user.bot).size;
   return { total, humans: total - bots, bots };
-}
+};
 
-// =====================
+// ─────────────────────────────────────────
 // Bot Ready
-// =====================
+// ─────────────────────────────────────────
 client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`Online — ${client.user.tag}`);
   client.guilds.cache.forEach(g => initGuild(g.id));
 });
 
-// =====================
-// Track deleted messages / images
-// =====================
+// ─────────────────────────────────────────
+// Track deleted messages
+// ─────────────────────────────────────────
 client.on('messageDelete', message => {
   if (!message.guild || message.author?.bot) return;
   deletedMessages[message.guild.id] = {
     content:     message.content || null,
     author:      message.author?.tag || 'Unknown',
-    authorId:    message.author?.id || null,
     channel:     message.channel?.name || 'unknown',
     attachments: [...(message.attachments?.values() || [])].map(a => ({ url: a.url, name: a.name })),
     timestamp:   Date.now(),
   };
 });
 
-// =====================
-// Member Join — Welcome + Alt Check + Log
-// =====================
+// ─────────────────────────────────────────
+// Member Join
+// ─────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
   initGuild(member.guild.id);
   const guild   = member.guild;
   const ageDays = Math.floor((Date.now() - member.user.createdTimestamp) / 86400000);
-  const isAlt   = ageDays < 30;
-  const isSusp  = ageDays < 7;
   const { total } = getMemberCount(guild);
 
-  // Welcome message
-  const welcomeChannel = guild.channels.cache.find(
-    ch => ['welcome', 'general', 'lobby'].includes(ch.name)
-  );
+  const welcomeChannel = guild.channels.cache.find(ch => ['welcome','general','lobby'].includes(ch.name));
   if (welcomeChannel) {
     await welcomeChannel.send({ embeds: [
-      bwEmbed(`Welcome to ${guild.name}`)
-        .setDescription(`${member.user.username} just joined the server.`)
+      bw(`Welcome to ${guild.name}`)
+        .setDescription(`${member.user.username} just joined.`)
         .setThumbnail(member.user.displayAvatarURL())
         .addFields(
-          { name: 'Member',        value: `<@${member.user.id}>`, inline: true },
-          { name: 'Total Members', value: `${total}`,             inline: true },
+          { name: 'Member', value: `<@${member.user.id}>`, inline: true },
+          { name: 'Count',  value: `${total}`,             inline: true },
         )
         .setFooter({ text: `Member #${total}` })
         .setTimestamp()
     ]}).catch(() => {});
   }
 
-  // Log
-  const logEmbed = bwEmbed('Member Joined')
+  const logEmbed = bw('Member Joined')
     .setThumbnail(member.user.displayAvatarURL())
     .addFields(
-      { name: 'User',         value: `${member.user.tag}`, inline: true },
-      { name: 'ID',           value: `${member.user.id}`,  inline: true },
-      { name: 'Account Age',  value: `${ageDays} days`,    inline: true },
-      { name: 'Member Count', value: `${total}`,           inline: true },
-      { name: 'Alt Risk',     value: isSusp ? 'HIGH — under 7 days' : isAlt ? 'MEDIUM — under 30 days' : 'None', inline: true },
+      { name: 'User',        value: `${member.user.tag}`, inline: true },
+      { name: 'ID',          value: `${member.user.id}`,  inline: true },
+      { name: 'Account Age', value: `${ageDays}d`,        inline: true },
+      { name: 'Members',     value: `${total}`,           inline: true },
+      { name: 'Alt Risk',    value: ageDays < 7 ? 'HIGH' : ageDays < 30 ? 'MEDIUM' : 'None', inline: true },
     ).setTimestamp();
-  if (isSusp)     logEmbed.setColor(0xED4245);
-  else if (isAlt) logEmbed.setColor(0xFEE75C);
+
+  if (ageDays < 7)       logEmbed.setColor(0xED4245);
+  else if (ageDays < 30) logEmbed.setColor(0xFEE75C);
   await sendLog(guild, logEmbed);
 
-  if (isSusp) {
+  if (ageDays < 7) {
     const lc = getLogChannel(guild);
     if (lc) lc.send(`[ALT ALERT] <@${member.user.id}> — account is only ${ageDays} day(s) old.`).catch(() => {});
   }
 });
 
-// =====================
-// Member Leave Log
-// =====================
+// ─────────────────────────────────────────
+// Member Leave
+// ─────────────────────────────────────────
 client.on('guildMemberRemove', async member => {
   const { total } = getMemberCount(member.guild);
-  await sendLog(member.guild, bwEmbed('Member Left')
+  await sendLog(member.guild, bw('Member Left')
     .setThumbnail(member.user.displayAvatarURL())
     .addFields(
       { name: 'User',      value: `${member.user.tag}`, inline: true },
@@ -161,9 +161,9 @@ client.on('guildMemberRemove', async member => {
     ).setTimestamp());
 });
 
-// =====================
+// ─────────────────────────────────────────
 // Rogue Bot — Channel Delete
-// =====================
+// ─────────────────────────────────────────
 client.on('channelDelete', async channel => {
   const guild = channel.guild;
   if (!guild) return;
@@ -178,69 +178,191 @@ client.on('channelDelete', async channel => {
     if (!channelDeleteTracker[guild.id][executor.id]) channelDeleteTracker[guild.id][executor.id] = [];
     const now = Date.now();
     channelDeleteTracker[guild.id][executor.id].push(now);
-    channelDeleteTracker[guild.id][executor.id] =
-      channelDeleteTracker[guild.id][executor.id].filter(t => now - t < 60000);
+    channelDeleteTracker[guild.id][executor.id] = channelDeleteTracker[guild.id][executor.id].filter(t => now - t < 60000);
     if (channelDeleteTracker[guild.id][executor.id].length >= 2) {
       const member = guild.members.cache.get(executor.id);
       if (member?.bannable) {
         await member.ban({ reason: 'Rogue bot: mass channel deletion' });
-        await sendLog(guild, bwEmbed('Rogue Bot Banned')
-          .addFields(
-            { name: 'Bot',    value: `${executor.tag}`,       inline: true },
-            { name: 'Reason', value: 'Mass channel deletion',  inline: true },
-          ).setTimestamp());
+        await sendLog(guild, bw('Rogue Bot Banned').addFields(
+          { name: 'Bot',    value: `${executor.tag}`,      inline: true },
+          { name: 'Reason', value: 'Mass channel deletion', inline: true },
+        ).setTimestamp());
       }
     }
-  } catch (e) { console.error('Channel delete audit error:', e.message); }
+  } catch (e) { console.error('Channel delete audit:', e.message); }
 });
 
-// =====================
-// Button Interactions (Verify)
-// =====================
+// ─────────────────────────────────────────
+// Button Interactions
+// ─────────────────────────────────────────
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isButton()) return;
-  if (interaction.customId !== 'verify_button') return;
-
   const guild  = interaction.guild;
   const member = interaction.member;
-  const config = verifyConfig[guild.id];
 
-  if (!config) {
-    return interaction.reply({ content: 'Verification is not configured. Ask an admin to run `+setupverify`.', ephemeral: true });
-  }
-
-  const role = guild.roles.cache.get(config.roleId);
-  if (!role) {
-    return interaction.reply({ content: 'The verified role no longer exists. Ask an admin to reconfigure.', ephemeral: true });
-  }
-
-  if (member.roles.cache.has(role.id)) {
-    return interaction.reply({ content: 'You are already verified.', ephemeral: true });
-  }
-
-  try {
-    await member.roles.add(role);
-    await interaction.reply({ content: `You have been verified and given the **${role.name}** role.`, ephemeral: true });
-    await sendLog(guild, bwEmbed('Member Verified')
-      .addFields(
+  // ── Verify ─────────────────────────────
+  if (interaction.customId === 'verify_button') {
+    const config = verifyConfig[guild.id];
+    if (!config) return interaction.reply({ content: 'Verification is not configured. Ask an admin to run `+setupverify`.', ephemeral: true });
+    const role = guild.roles.cache.get(config.roleId);
+    if (!role) return interaction.reply({ content: 'Verified role not found. Ask an admin to reconfigure with `+setupverify`.', ephemeral: true });
+    if (member.roles.cache.has(role.id)) return interaction.reply({ content: 'You are already verified.', ephemeral: true });
+    try {
+      await member.roles.add(role);
+      await interaction.reply({ content: `You have been verified and given the **${role.name}** role. Welcome.`, ephemeral: true });
+      await sendLog(guild, bw('Member Verified').addFields(
         { name: 'User', value: `${interaction.user.tag}`, inline: true },
-        { name: 'ID',   value: `${interaction.user.id}`,  inline: true },
         { name: 'Role', value: role.name,                  inline: true },
       ).setTimestamp());
-  } catch (e) {
-    await interaction.reply({ content: 'Failed to assign role. Make sure the bot role is above the verified role.', ephemeral: true });
+    } catch {
+      await interaction.reply({ content: 'Failed to assign role. Make sure the bot role is above the verified role in Server Settings.', ephemeral: true });
+    }
+    return;
+  }
+
+  // ── Open Ticket ────────────────────────
+  if (interaction.customId === 'ticket_open') {
+    const config = ticketConfig[guild.id];
+    if (!config) return interaction.reply({ content: 'Ticket system is not configured.', ephemeral: true });
+
+    const existing = Object.entries(openTickets).find(([, t]) => t.userId === interaction.user.id && t.guildId === guild.id);
+    if (existing) return interaction.reply({ content: `You already have an open ticket: <#${existing[0]}>`, ephemeral: true });
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const category = config.categoryId ? guild.channels.cache.get(config.categoryId) : null;
+      const ticketChannel = await guild.channels.create({
+        name: `ticket-${interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20)}`,
+        type: ChannelType.GuildText,
+        parent: category || undefined,
+        permissionOverwrites: [
+          { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
+          { id: interaction.user.id,  allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
+          { id: client.user.id,       allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels] },
+          ...(config.supportRoleId ? [{ id: config.supportRoleId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] }] : []),
+        ],
+      });
+
+      openTickets[ticketChannel.id] = { userId: interaction.user.id, claimedBy: null, guildId: guild.id };
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ticket_claim').setLabel('Claim').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('ticket_close').setLabel('Close Ticket').setStyle(ButtonStyle.Danger),
+      );
+
+      const banner = new AttachmentBuilder(BANNER_PATH, { name: 'banner.png' });
+
+      await ticketChannel.send({
+        content: `<@${interaction.user.id}>`,
+        files: [banner],
+        embeds: [
+          bw('Support Ticket')
+            .setImage('attachment://banner.png')
+            .addFields(
+              { name: 'Opened by', value: `${interaction.user.tag}`, inline: true },
+              { name: 'Status',    value: 'Open — awaiting staff',   inline: true },
+            )
+            .setDescription('Describe your issue below. A staff member will be with you shortly.')
+            .setFooter({ text: 'Claim to assign yourself · Close to delete this ticket' })
+            .setTimestamp()
+        ],
+        components: [row],
+      });
+
+      await interaction.editReply({ content: `Your ticket has been created: <#${ticketChannel.id}>` });
+      await sendLog(guild, bw('Ticket Opened').addFields(
+        { name: 'User',    value: `${interaction.user.tag}`, inline: true },
+        { name: 'Channel', value: `#${ticketChannel.name}`,  inline: true },
+      ).setTimestamp());
+    } catch (e) {
+      console.error('Ticket open error:', e.message);
+      await interaction.editReply({ content: 'Failed to create ticket channel. Make sure I have Manage Channels permission.' });
+    }
+    return;
+  }
+
+  // ── Claim Ticket ───────────────────────
+  if (interaction.customId === 'ticket_claim') {
+    const ticket = openTickets[interaction.channelId];
+    if (!ticket) return interaction.reply({ content: 'This is not an active ticket.', ephemeral: true });
+
+    const config = ticketConfig[guild.id];
+    const hasSupportRole = config?.supportRoleId && member.roles.cache.has(config.supportRoleId);
+    const isAdmin        = member.permissions.has(PermissionsBitField.Flags.Administrator);
+
+    if (!hasSupportRole && !isAdmin) return interaction.reply({ content: 'Only support staff can claim tickets.', ephemeral: true });
+    if (ticket.claimedBy)            return interaction.reply({ content: `Already claimed by <@${ticket.claimedBy}>.`, ephemeral: true });
+
+    ticket.claimedBy = interaction.user.id;
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('ticket_claim').setLabel('Claimed').setStyle(ButtonStyle.Secondary).setDisabled(true),
+      new ButtonBuilder().setCustomId('ticket_close').setLabel('Close Ticket').setStyle(ButtonStyle.Danger),
+    );
+
+    const banner = new AttachmentBuilder(BANNER_PATH, { name: 'banner.png' });
+
+    await interaction.update({
+      files: [banner],
+      embeds: [
+        bw('Support Ticket')
+          .setImage('attachment://banner.png')
+          .addFields(
+            { name: 'Opened by',  value: `<@${ticket.userId}>`,       inline: true },
+            { name: 'Claimed by', value: `${interaction.user.tag}`,    inline: true },
+            { name: 'Status',     value: 'Claimed',                    inline: true },
+          )
+          .setFooter({ text: 'Ticket has been claimed' })
+          .setTimestamp()
+      ],
+      components: [row],
+    });
+
+    await sendLog(guild, bw('Ticket Claimed').addFields(
+      { name: 'Claimed by', value: `${interaction.user.tag}`,       inline: true },
+      { name: 'Channel',    value: `#${interaction.channel.name}`,  inline: true },
+    ).setTimestamp());
+    return;
+  }
+
+  // ── Close Ticket ───────────────────────
+  if (interaction.customId === 'ticket_close') {
+    const ticket = openTickets[interaction.channelId];
+    if (!ticket) return interaction.reply({ content: 'This is not an active ticket.', ephemeral: true });
+
+    const config         = ticketConfig[guild.id];
+    const hasSupportRole = config?.supportRoleId && member.roles.cache.has(config.supportRoleId);
+    const hasCloseRole   = config?.closeRoleId   && member.roles.cache.has(config.closeRoleId);
+    const isAdmin        = member.permissions.has(PermissionsBitField.Flags.Administrator);
+    const isTicketOwner  = interaction.user.id === ticket.userId;
+
+    if (!hasSupportRole && !hasCloseRole && !isAdmin && !isTicketOwner) {
+      return interaction.reply({ content: 'You do not have permission to close this ticket.', ephemeral: true });
+    }
+
+    await interaction.reply({ content: `Ticket closed by ${interaction.user.tag}. Channel deletes in 5 seconds.` });
+    await sendLog(guild, bw('Ticket Closed').addFields(
+      { name: 'Closed by', value: `${interaction.user.tag}`,      inline: true },
+      { name: 'Channel',   value: `#${interaction.channel.name}`, inline: true },
+      { name: 'Opened by', value: `<@${ticket.userId}>`,          inline: true },
+    ).setTimestamp());
+
+    delete openTickets[interaction.channelId];
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    return;
   }
 });
 
-// =====================
+// ─────────────────────────────────────────
 // Message Handler
-// =====================
+// ─────────────────────────────────────────
 client.on('messageCreate', async message => {
   const guild = message.guild;
   if (!guild) return;
   initGuild(guild.id);
 
-  // ---- Rogue bot spam detection ----
+  // ── Rogue bot spam ─────────────────────
   if (message.author.bot && message.author.id !== client.user.id) {
     if (!botSpamTracker[guild.id]) botSpamTracker[guild.id] = {};
     const botId = message.author.id;
@@ -251,14 +373,13 @@ client.on('messageCreate', async message => {
       if (botSpamTracker[guild.id]) botSpamTracker[guild.id][botId] = { count: 0, timer: null };
     }, 5000);
     if (botSpamTracker[guild.id][botId].count >= 8) {
-      const member = guild.members.cache.get(botId);
-      if (member?.bannable) {
-        await member.ban({ reason: 'Rogue bot: message spam' });
-        await sendLog(guild, bwEmbed('Rogue Bot Banned')
-          .addFields(
-            { name: 'Bot',    value: `${message.author.tag}`,  inline: true },
-            { name: 'Reason', value: '8+ messages in 5 seconds', inline: true },
-          ).setTimestamp());
+      const m = guild.members.cache.get(botId);
+      if (m?.bannable) {
+        await m.ban({ reason: 'Rogue bot: message spam' });
+        await sendLog(guild, bw('Rogue Bot Banned').addFields(
+          { name: 'Bot',    value: `${message.author.tag}`,    inline: true },
+          { name: 'Reason', value: '8+ messages in 5 seconds', inline: true },
+        ).setTimestamp());
       }
     }
     return;
@@ -271,7 +392,7 @@ client.on('messageCreate', async message => {
   const isServerOwner = isOwner(message.member);
   const whitelisted   = isWhitelisted(message.member);
 
-  // ---- Repeated message spam detection ----
+  // ── Repeated spam ──────────────────────
   if (!isAdmin && !isMod && !whitelisted) {
     const uid     = message.author.id;
     const content = message.content.trim().toLowerCase();
@@ -279,419 +400,192 @@ client.on('messageCreate', async message => {
       userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
     }
     const tracker = userSpamTracker[guild.id][uid];
-
     if (content && content === tracker.content) {
       tracker.count++;
       tracker.messageIds.push(message.id);
     } else {
-      // Different message — reset
       tracker.content    = content;
       tracker.count      = 1;
       tracker.messageIds = [message.id];
     }
-
-    // Reset after 10 seconds of no spam
     if (tracker.timer) clearTimeout(tracker.timer);
     tracker.timer = setTimeout(() => {
-      if (userSpamTracker[guild.id]) {
-        userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
-      }
+      if (userSpamTracker[guild.id]) userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
     }, 10000);
 
     if (tracker.count >= 5) {
-      // Delete the last 5 spam messages
-      const idsToDelete = tracker.messageIds.slice(-5);
-      for (const id of idsToDelete) {
-        await message.channel.messages.fetch(id)
-          .then(m => m.delete().catch(() => {}))
-          .catch(() => {});
+      for (const id of tracker.messageIds.slice(-5)) {
+        await message.channel.messages.fetch(id).then(m => m.delete().catch(() => {})).catch(() => {});
       }
-
-      // Warn or kick based on existing warnings
       if (!warnings[guild.id][uid]) warnings[guild.id][uid] = 0;
       warnings[guild.id][uid]++;
-      const warnCount = warnings[guild.id][uid];
-
-      // Reset spam tracker after action
       userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
 
-      if (warnCount === 1) {
-        const warn = await message.channel.send(
-          `${message.author.username}, stop spamming. Your repeated messages have been deleted. This is your warning — a second offence will result in a kick.`
-        );
-        setTimeout(() => warn.delete().catch(() => {}), 8000);
-        await sendLog(guild, bwEmbed('Spam Warning')
-          .addFields(
-            { name: 'User',     value: `${message.author.tag}`,    inline: true },
-            { name: 'Channel',  value: `#${message.channel.name}`, inline: true },
-            { name: 'Repeated', value: `"${message.content.slice(0, 80)}"` },
-            { name: 'Deleted',  value: `${idsToDelete.length} message(s)` },
-          ).setTimestamp());
+      if (warnings[guild.id][uid] === 1) {
+        const w = await message.channel.send(`${message.author.username}, stop spamming. Messages deleted. Next offence results in a kick.`);
+        setTimeout(() => w.delete().catch(() => {}), 8000);
+        await sendLog(guild, bw('Spam Warning').addFields(
+          { name: 'User',    value: `${message.author.tag}`,    inline: true },
+          { name: 'Channel', value: `#${message.channel.name}`, inline: true },
+        ).setTimestamp());
       } else {
         if (message.member.kickable) {
           await message.member.kick('Repeated spam after warning');
-          await sendLog(guild, bwEmbed('Member Kicked — Spam')
-            .addFields(
-              { name: 'User',   value: `${message.author.tag}`, inline: true },
-              { name: 'Reason', value: 'Repeated spam after warning' },
-            ).setTimestamp());
           warnings[guild.id][uid] = 0;
+          await sendLog(guild, bw('Member Kicked — Spam').addFields(
+            { name: 'User', value: `${message.author.tag}`, inline: true },
+          ).setTimestamp());
         }
       }
       return;
     }
   }
 
-  // ---- Malicious content ----
+  // ── Malicious content ──────────────────
   if (!isAdmin && !isMod && !whitelisted && MALICIOUS_REGEX.test(message.content)) {
     await message.delete().catch(() => {});
     if (!warnings[guild.id][message.author.id]) warnings[guild.id][message.author.id] = 0;
     warnings[guild.id][message.author.id]++;
-    const warnCount = warnings[guild.id][message.author.id];
 
-    if (warnCount === 1) {
-      const warn = await message.channel.send(
-        `${message.author.username}, your message was removed. This is your warning. A second violation will result in a kick.`
-      );
-      setTimeout(() => warn.delete().catch(() => {}), 8000);
-      await sendLog(guild, bwEmbed('Member Warned')
-        .addFields(
-          { name: 'User',    value: `${message.author.tag}`,    inline: true },
-          { name: 'Channel', value: `#${message.channel.name}`, inline: true },
-          { name: 'Offence', value: '1st warning issued' },
-          { name: 'Message', value: message.content.slice(0, 300) },
-        ).setTimestamp());
+    if (warnings[guild.id][message.author.id] === 1) {
+      const w = await message.channel.send(`${message.author.username}, your message was removed. This is your warning. A second violation results in a kick.`);
+      setTimeout(() => w.delete().catch(() => {}), 8000);
+      await sendLog(guild, bw('Member Warned').addFields(
+        { name: 'User',    value: `${message.author.tag}`,    inline: true },
+        { name: 'Channel', value: `#${message.channel.name}`, inline: true },
+        { name: 'Message', value: message.content.slice(0, 300) },
+      ).setTimestamp());
     } else {
       if (message.member.kickable) {
         await message.member.kick('Repeated malicious content after warning');
         warnings[guild.id][message.author.id] = 0;
-        await sendLog(guild, bwEmbed('Member Kicked')
-          .addFields(
-            { name: 'User',   value: `${message.author.tag}`,                      inline: true },
-            { name: 'Reason', value: 'Repeated malicious content after warning' },
-          ).setTimestamp());
+        await sendLog(guild, bw('Member Kicked').addFields(
+          { name: 'User',   value: `${message.author.tag}`,      inline: true },
+          { name: 'Reason', value: 'Repeated malicious content' },
+        ).setTimestamp());
       }
     }
     return;
   }
 
-  // ---- Prefix check ----
+  // ── Prefix ─────────────────────────────
   if (!message.content.startsWith(PREFIX)) return;
   const args    = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const command = args.shift().toLowerCase();
 
-  // =====================
-  // +help
-  // =====================
+  // ══════════════════════════════════════
+  // COMMANDS
+  // ══════════════════════════════════════
+
+  // ── +help ──────────────────────────────
   if (command === 'help' || command === 'commands') {
-    return message.reply({ embeds: [
-      bwEmbed('Commands')
-        .setDescription(`Prefix: \`${PREFIX}\``)
-        .addFields(
-          { name: 'General',
-            value: '`+ping`  `+members`  `+userinfo [@user]`  `+serverinfo`  `+grab`' },
-          { name: 'Countdown',
-            value: '`+countdown set YYYY-MM-DD HH:MM label` — set a countdown\n`+countdown` — show current countdown\n`+countdown clear` — remove countdown' },
-          { name: 'Moderation',
-            value: '`+clear [1-100]`  `+clearall`  `+warnings [@user]`  `+clearwarnings [@user]`' },
-          { name: 'Whitelist — Owner/Admin',
-            value: '`+whitelist add/remove user @user`\n`+whitelist add/remove role @role`\n`+whitelist list`' },
-          { name: 'Announce — Whitelist only',
-            value: '`+say #channel Your message` — sends as bot. Attach image if needed.\n`+dmall Your message` — DMs every member (Owner/Admin only)' },
-          { name: 'Setup — Admin only',
-            value: '`+setuplogs` — creates #logs channel\n`+setupverify #channel @role` — sets up verify button' },
-        ).setTimestamp()
-    ]});
+    const embed = new EmbedBuilder()
+      .setColor(0x000000)
+      .setTitle('Command Reference')
+      .setDescription(`Prefix \`${PREFIX}\`  ·  All times UTC  ·  Bot by Avia`)
+      .addFields(
+        { name: '◆  General',
+          value: [
+            '`+ping` — latency check',
+            '`+members` — member count breakdown',
+            '`+userinfo [@user]` — profile, age, warnings, alt risk',
+            '`+serverinfo` — server snapshot',
+            '`+grab` — recover last deleted message or image',
+          ].join('\n') },
+        { name: '◆  Countdown',
+          value: [
+            '`+countdown` — show active countdown',
+            '`+countdown set YYYY-MM-DD HH:MM Label` — create',
+            '`+countdown clear` — remove',
+          ].join('\n') },
+        { name: '◆  Moderation  *(Mod+)*',
+          value: [
+            '`+clear [1–100]` — bulk delete recent messages',
+            '`+clearall` — wipe entire channel history',
+            '`+warnings @user` — view warning count',
+            '`+clearwarnings @user` — reset warnings',
+          ].join('\n') },
+        { name: '◆  Channel Control  *(Admin)*',
+          value: [
+            '`+hide #channel` — hide from @everyone',
+            '`+hide #channel @role` — hide but allow one role',
+            '`+unhide #channel` — restore @everyone access',
+          ].join('\n') },
+        { name: '◆  Whitelist  *(Owner / Admin)*',
+          value: [
+            '`+whitelist add user @user`',
+            '`+whitelist remove user @user`',
+            '`+whitelist add role @role`',
+            '`+whitelist remove role @role`',
+            '`+whitelist list` — view current list',
+          ].join('\n') },
+        { name: '◆  Broadcast  *(Whitelist / Admin)*',
+          value: [
+            '`+say #channel message` — post as bot via webhook',
+            '`+dmall message` — DM every human member',
+          ].join('\n') },
+        { name: '◆  Setup  *(Admin only)*',
+          value: [
+            '`+setuplogs` — create #logs channel',
+            '`+setupverify #channel @role` — verify gate with button',
+            '`+setuptickets #channel @support-role @close-role` — ticket panel',
+            '`+closeticket` — force close current ticket channel',
+          ].join('\n') },
+        { name: '◆  Auto Security',
+          value: [
+            'Links / scam text → warn → kick',
+            'Repeated identical messages (5x) → warn → kick',
+            'New accounts < 7 days → flagged in #logs',
+            'Rogue bots spamming or deleting channels → instant ban',
+          ].join('\n') },
+      )
+      .setFooter({ text: 'Avia  ·  Minimal. Secure. Reliable.' })
+      .setTimestamp();
+    return message.reply({ embeds: [embed] });
   }
 
-  // =====================
-  // +ping
-  // =====================
+  // ── +ping ──────────────────────────────
   if (command === 'ping') {
     return message.reply(`Pong. Latency: **${client.ws.ping}ms**`);
   }
 
-  // =====================
-  // +members
-  // =====================
+  // ── +members ───────────────────────────
   if (command === 'members') {
     const { total, humans, bots } = getMemberCount(guild);
     return message.reply({ embeds: [
-      bwEmbed('Member Count')
-        .addFields(
-          { name: 'Total',  value: `${total}`,  inline: true },
-          { name: 'Humans', value: `${humans}`, inline: true },
-          { name: 'Bots',   value: `${bots}`,   inline: true },
-        ).setTimestamp()
+      bw('Member Count').addFields(
+        { name: 'Total',  value: `${total}`,  inline: true },
+        { name: 'Humans', value: `${humans}`, inline: true },
+        { name: 'Bots',   value: `${bots}`,   inline: true },
+      ).setTimestamp()
     ]});
   }
 
-  // =====================
-  // +countdown — show, set, or clear a countdown
-  // =====================
-  if (command === 'countdown') {
-    const sub = args[0]?.toLowerCase();
-
-    // +countdown clear
-    if (sub === 'clear') {
-      if (!isAdmin) return message.reply('You need Administrator to clear the countdown.');
-      delete countdowns[guild.id];
-      return message.reply('Countdown cleared.');
-    }
-
-    // +countdown set YYYY-MM-DD HH:MM label
-    if (sub === 'set') {
-      if (!isAdmin) return message.reply('You need Administrator to set the countdown.');
-
-      // args: ['set', 'YYYY-MM-DD', 'HH:MM', ...label words]
-      const datePart  = args[1];
-      const timePart  = args[2] || '00:00';
-      const label     = args.slice(3).join(' ') || 'Countdown';
-
-      if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
-        return message.reply('Format: `+countdown set YYYY-MM-DD HH:MM Label`\nExample: `+countdown set 2025-12-31 23:59 New Year`');
-      }
-
-      const target = new Date(`${datePart}T${timePart}:00`);
-      if (isNaN(target.getTime())) {
-        return message.reply('Invalid date or time. Use format: `YYYY-MM-DD HH:MM`');
-      }
-      if (target <= new Date()) {
-        return message.reply('That date is already in the past.');
-      }
-
-      countdowns[guild.id] = { date: target, label };
-      const diff   = target - Date.now();
-      const days   = Math.floor(diff / 86400000);
-      const hours  = Math.floor((diff % 86400000) / 3600000);
-      const mins   = Math.floor((diff % 3600000) / 60000);
-
-      return message.reply({ embeds: [
-        bwEmbed(label)
-          .setDescription(`Countdown set. Use \`+countdown\` anytime to check it.`)
-          .addFields(
-            { name: 'Target Date', value: target.toUTCString().replace(' GMT', ' UTC'), inline: false },
-            { name: 'Time Remaining', value: `${days}d ${hours}h ${mins}m`, inline: false },
-          ).setTimestamp()
-      ]});
-    }
-
-    // +countdown — show current
-    const cd = countdowns[guild.id];
-    if (!cd) {
-      return message.reply('No countdown set. Use `+countdown set YYYY-MM-DD HH:MM Label` to set one.');
-    }
-
-    const now  = Date.now();
-    const diff = cd.date - now;
-
-    if (diff <= 0) {
-      delete countdowns[guild.id];
-      return message.reply({ embeds: [
-        bwEmbed(cd.label)
-          .setDescription('The countdown has ended.')
-          .setTimestamp()
-      ]});
-    }
-
-    const days  = Math.floor(diff / 86400000);
-    const hours = Math.floor((diff % 86400000) / 3600000);
-    const mins  = Math.floor((diff % 3600000) / 60000);
-    const secs  = Math.floor((diff % 60000) / 1000);
-
-    // Build a clean visual bar
-    const totalDays    = Math.ceil((cd.date - new Date(cd.date).setHours(0,0,0,0) + diff) / 86400000);
-    const progress     = Math.max(0, Math.min(20, Math.floor((1 - diff / (cd.date - now + diff)) * 20)));
-    const bar          = '█'.repeat(progress) + '░'.repeat(20 - progress);
-
-    return message.reply({ embeds: [
-      new EmbedBuilder()
-        .setColor(0x000000)
-        .setTitle(cd.label)
-        .setDescription(`\`${bar}\``)
-        .addFields(
-          { name: 'Days',    value: `${days}`,  inline: true },
-          { name: 'Hours',   value: `${hours}`, inline: true },
-          { name: 'Minutes', value: `${mins}`,  inline: true },
-          { name: 'Seconds', value: `${secs}`,  inline: true },
-          { name: 'Target',  value: cd.date.toUTCString().replace(' GMT', ' UTC'), inline: false },
-        )
-        .setFooter({ text: 'Run +countdown again to refresh' })
-        .setTimestamp()
-    ]});
-  }
-
-  // =====================
-  // +dmall <message> — DM every human member in the server
-  // Owner/Admin only
-  // =====================
-  if (command === 'dmall') {
-    if (!isServerOwner && !isAdmin) {
-      return message.reply('Only the server owner or admins can use this command.');
-    }
-
-    const content = args.join(' ');
-    if (!content) return message.reply('Provide a message. Example: `+dmall Hello everyone!`');
-
-    // Confirm first to avoid accidental mass DMs
-    const attachment = message.attachments.first();
-
-    await message.reply('Starting DM broadcast. This may take a while...');
-
-    // Fetch all members
-    await guild.members.fetch();
-    const humans = guild.members.cache.filter(m => !m.user.bot);
-
-    let sent    = 0;
-    let failed  = 0;
-
-    const embed = new EmbedBuilder()
-      .setColor(0x000000)
-      .setTitle(`Message from ${guild.name}`)
-      .setDescription(content)
-      .setThumbnail(guild.iconURL())
-      .setFooter({ text: `Sent by ${guild.name}` })
-      .setTimestamp();
-
-    for (const [, member] of humans) {
-      try {
-        await member.send({
-          embeds: [embed],
-          files: attachment ? [attachment.url] : [],
-        });
-        sent++;
-      } catch (e) {
-        failed++; // user has DMs disabled or blocked the bot
-      }
-      // Small delay to avoid hitting Discord rate limits
-      await new Promise(r => setTimeout(r, 800));
-    }
-
-    const summary = await message.channel.send(
-      `DM broadcast complete.\n**Sent:** ${sent}\n**Failed:** ${failed} (users with DMs disabled)`
-    );
-
-    await sendLog(guild, bwEmbed('DM Broadcast Sent')
-      .addFields(
-        { name: 'By',      value: message.author.tag, inline: true },
-        { name: 'Sent',    value: `${sent}`,           inline: true },
-        { name: 'Failed',  value: `${failed}`,         inline: true },
-        { name: 'Message', value: content.slice(0, 300) },
-      ).setTimestamp());
-
-    return;
-  }
-
-  // =====================
-  // +grab — last deleted message or image
-  // =====================
-  if (command === 'grab') {
-    if (!isAdmin && !isMod) return message.reply('You need Manage Messages to use this.');
-    const last = deletedMessages[guild.id];
-    if (!last) return message.reply('No deleted messages recorded yet.');
-
-    const timeSince = Math.floor((Date.now() - last.timestamp) / 1000);
-    const embed = bwEmbed('Last Deleted Message')
-      .addFields(
-        { name: 'Author',  value: last.author,           inline: true },
-        { name: 'Channel', value: `#${last.channel}`,    inline: true },
-        { name: 'Deleted', value: `${timeSince}s ago`,   inline: true },
-      ).setTimestamp();
-
-    if (last.content) embed.setDescription(last.content);
-
-    const files = [];
-    if (last.attachments.length > 0) {
-      embed.addFields({ name: 'Attachments', value: last.attachments.map(a => a.name).join(', ') });
-      files.push(...last.attachments.map(a => a.url));
-    }
-
-    return message.reply({ embeds: [embed], files }).catch(() =>
-      message.reply({ embeds: [embed] }) // fallback if attachment URL expired
-    );
-  }
-
-  // =====================
-  // +setuplogs
-  // =====================
-  if (command === 'setuplogs') {
-    if (!isAdmin) return message.reply('You need Administrator to use this.');
-    const existing = getLogChannel(guild);
-    if (existing) return message.reply(`Logs channel already exists: <#${existing.id}>`);
-    try {
-      const created = await guild.channels.create({
-        name: 'logs',
-        reason: 'Bot log channel setup',
-        permissionOverwrites: [
-          { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.SendMessages] },
-        ],
-      });
-      return message.reply(`Logs channel created: <#${created.id}>. Members cannot send messages there.`);
-    } catch (e) {
-      return message.reply('Failed to create logs channel. Make sure I have Manage Channels permission.');
-    }
-  }
-
-  // =====================
-  // +setupverify #channel @role
-  // =====================
-  if (command === 'setupverify') {
-    if (!isAdmin) return message.reply('You need Administrator to use this.');
-    const targetChannel = message.mentions.channels.first();
-    const role          = message.mentions.roles.first();
-
-    if (!targetChannel || !role) {
-      return message.reply('Usage: `+setupverify #channel @role`\nExample: `+setupverify #verify @Member`');
-    }
-
-    const verifyEmbed = bwEmbed(`Verify — ${guild.name}`)
-      .setDescription('Press the button below to verify and gain access to the server.');
-
-    const button = new ButtonBuilder()
-      .setCustomId('verify_button')
-      .setLabel('Verify')
-      .setStyle(ButtonStyle.Secondary);
-
-    const row = new ActionRowBuilder().addComponents(button);
-
-    try {
-      await targetChannel.send({ embeds: [verifyEmbed], components: [row] });
-      verifyConfig[guild.id] = { roleId: role.id, channelId: targetChannel.id };
-      return message.reply(`Verification set up in <#${targetChannel.id}>. Role to assign: **${role.name}**.`);
-    } catch (e) {
-      return message.reply('Failed to send verify message. Make sure I can send messages in that channel.');
-    }
-  }
-
-  // =====================
-  // +userinfo
-  // =====================
+  // ── +userinfo ──────────────────────────
   if (command === 'userinfo') {
     const target    = message.mentions.members.first() || message.member;
     const ageDays   = Math.floor((Date.now() - target.user.createdTimestamp) / 86400000);
     const warnCount = warnings[guild.id]?.[target.user.id] || 0;
     return message.reply({ embeds: [
-      bwEmbed(`User — ${target.user.tag}`)
+      bw(`User — ${target.user.tag}`)
         .setThumbnail(target.user.displayAvatarURL())
         .addFields(
-          { name: 'ID',          value: target.user.id,  inline: true },
+          { name: 'ID',          value: target.user.id, inline: true },
           { name: 'Joined',      value: `<t:${Math.floor(target.joinedTimestamp / 1000)}:R>`, inline: true },
           { name: 'Account Age', value: `${ageDays} days`, inline: true },
-          { name: 'Warnings',    value: `${warnCount}`,   inline: true },
+          { name: 'Warnings',    value: `${warnCount}`,    inline: true },
           { name: 'Whitelisted', value: isWhitelisted(target) ? 'Yes' : 'No', inline: true },
           { name: 'Alt Risk',    value: ageDays < 7 ? 'High' : ageDays < 30 ? 'Medium' : 'None', inline: true },
-          { name: 'Roles',       value: target.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).join(', ') || 'None' },
+          { name: 'Roles', value: target.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name).join(', ') || 'None' },
         ).setTimestamp()
     ]});
   }
 
-  // =====================
-  // +serverinfo
-  // =====================
+  // ── +serverinfo ────────────────────────
   if (command === 'serverinfo') {
     const { total, humans, bots } = getMemberCount(guild);
     return message.reply({ embeds: [
-      bwEmbed(`Server — ${guild.name}`)
+      bw(`Server — ${guild.name}`)
         .setThumbnail(guild.iconURL())
         .addFields(
           { name: 'Owner',   value: `<@${guild.ownerId}>`, inline: true },
@@ -703,234 +597,331 @@ client.on('messageCreate', async message => {
     ]});
   }
 
-  // =====================
-  // +warnings
-  // =====================
+  // ── +countdown ─────────────────────────
+  if (command === 'countdown') {
+    const sub = args[0]?.toLowerCase();
+    if (sub === 'clear') {
+      if (!isAdmin) return message.reply('You need Administrator to clear the countdown.');
+      delete countdowns[guild.id];
+      return message.reply('Countdown cleared.');
+    }
+    if (sub === 'set') {
+      if (!isAdmin) return message.reply('You need Administrator to set a countdown.');
+      const datePart = args[1], timePart = args[2] || '00:00', label = args.slice(3).join(' ') || 'Countdown';
+      if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return message.reply('Format: `+countdown set YYYY-MM-DD HH:MM Label`');
+      const target = new Date(`${datePart}T${timePart}:00`);
+      if (isNaN(target.getTime())) return message.reply('Invalid date or time.');
+      if (target <= new Date()) return message.reply('That date is already in the past.');
+      countdowns[guild.id] = { date: target, label };
+      const diff = target - Date.now();
+      return message.reply({ embeds: [
+        bw(label).addFields(
+          { name: 'Target',         value: target.toUTCString().replace(' GMT', ' UTC') },
+          { name: 'Time Remaining', value: `${Math.floor(diff/86400000)}d ${Math.floor((diff%86400000)/3600000)}h ${Math.floor((diff%3600000)/60000)}m` },
+        ).setTimestamp()
+      ]});
+    }
+    const cd = countdowns[guild.id];
+    if (!cd) return message.reply('No countdown set. Use `+countdown set YYYY-MM-DD HH:MM Label`');
+    const diff = cd.date - Date.now();
+    if (diff <= 0) { delete countdowns[guild.id]; return message.reply({ embeds: [ bw(cd.label).setDescription('The countdown has ended.').setTimestamp() ] }); }
+    const d = Math.floor(diff/86400000), h = Math.floor((diff%86400000)/3600000), m = Math.floor((diff%3600000)/60000), s = Math.floor((diff%60000)/1000);
+    const filled = Math.max(0, Math.min(20, 20 - Math.floor((diff / (365*86400000)) * 20)));
+    return message.reply({ embeds: [
+      new EmbedBuilder().setColor(0x000000).setTitle(cd.label)
+        .setDescription(`\`${'█'.repeat(filled)}${'░'.repeat(20-filled)}\``)
+        .addFields(
+          { name: 'Days', value: `${d}`, inline: true }, { name: 'Hours', value: `${h}`, inline: true },
+          { name: 'Minutes', value: `${m}`, inline: true }, { name: 'Seconds', value: `${s}`, inline: true },
+          { name: 'Target', value: cd.date.toUTCString().replace(' GMT', ' UTC') },
+        ).setFooter({ text: 'Run +countdown to refresh' }).setTimestamp()
+    ]});
+  }
+
+  // ── +grab ──────────────────────────────
+  if (command === 'grab') {
+    if (!isAdmin && !isMod) return message.reply('You need Manage Messages to use this.');
+    const last = deletedMessages[guild.id];
+    if (!last) return message.reply('No deleted messages recorded yet.');
+    const embed = bw('Last Deleted Message').addFields(
+      { name: 'Author',  value: last.author,          inline: true },
+      { name: 'Channel', value: `#${last.channel}`,   inline: true },
+      { name: 'Deleted', value: `${Math.floor((Date.now()-last.timestamp)/1000)}s ago`, inline: true },
+    ).setTimestamp();
+    if (last.content) embed.setDescription(last.content);
+    const files = last.attachments.length > 0 ? last.attachments.map(a => a.url) : [];
+    return message.reply({ embeds: [embed], files }).catch(() => message.reply({ embeds: [embed] }));
+  }
+
+  // ── +warnings ──────────────────────────
   if (command === 'warnings') {
     if (!isAdmin && !isMod) return message.reply('You need Manage Messages to use this.');
     const target = message.mentions.users.first();
     if (!target) return message.reply('Mention a user. Example: `+warnings @user`');
-    const count = warnings[guild.id]?.[target.id] || 0;
-    return message.reply(`${target.tag} has ${count} warning(s).`);
+    return message.reply(`${target.tag} has ${warnings[guild.id]?.[target.id] || 0} warning(s).`);
   }
 
-  // =====================
-  // +clearwarnings
-  // =====================
+  // ── +clearwarnings ─────────────────────
   if (command === 'clearwarnings') {
     if (!isAdmin && !isMod) return message.reply('You need Manage Messages to use this.');
     const target = message.mentions.users.first();
-    if (!target) return message.reply('Mention a user. Example: `+clearwarnings @user`');
+    if (!target) return message.reply('Mention a user.');
     if (warnings[guild.id]) warnings[guild.id][target.id] = 0;
     return message.reply(`Warnings cleared for ${target.tag}.`);
   }
 
-  // =====================
-  // +whitelist
-  // =====================
+  // ── +whitelist ─────────────────────────
   if (command === 'whitelist') {
     if (!isServerOwner && !isAdmin) return message.reply('Only the server owner or admins can manage the whitelist.');
-    const sub  = args[0]?.toLowerCase();
-    const type = args[1]?.toLowerCase();
-
+    const sub = args[0]?.toLowerCase(), type = args[1]?.toLowerCase();
     if (sub === 'list') {
-      const wl    = whitelist[guild.id];
-      const users = wl?.users.size > 0 ? [...wl.users].map(id => `<@${id}>`).join(', ')    : 'None';
-      const roles = wl?.roles.size > 0 ? [...wl.roles].map(id => `<@&${id}>`).join(', ') : 'None';
-      return message.reply({ embeds: [
-        bwEmbed('Whitelist').addFields(
-          { name: 'Users', value: users },
-          { name: 'Roles', value: roles },
-        )
-      ]});
+      const wl = whitelist[guild.id];
+      return message.reply({ embeds: [ bw('Whitelist').addFields(
+        { name: 'Users', value: wl?.users.size > 0 ? [...wl.users].map(id=>`<@${id}>`).join(', ') : 'None' },
+        { name: 'Roles', value: wl?.roles.size > 0 ? [...wl.roles].map(id=>`<@&${id}>`).join(', ') : 'None' },
+      ) ]});
     }
-
-    if (!['add', 'remove'].includes(sub) || !['user', 'role'].includes(type)) {
-      return message.reply('Usage: `+whitelist add/remove user/role @mention`');
-    }
-
+    if (!['add','remove'].includes(sub) || !['user','role'].includes(type)) return message.reply('Usage: `+whitelist add/remove user/role @mention`');
     if (type === 'user') {
       const target = message.mentions.users.first();
       if (!target) return message.reply('Please mention a user.');
-      whitelist[guild.id].users[sub === 'add' ? 'add' : 'delete'](target.id);
-      return message.reply(`${target.tag} ${sub === 'add' ? 'added to' : 'removed from'} whitelist.`);
+      whitelist[guild.id].users[sub==='add'?'add':'delete'](target.id);
+      return message.reply(`${target.tag} ${sub==='add'?'added to':'removed from'} whitelist.`);
     }
     if (type === 'role') {
       const role = message.mentions.roles.first();
       if (!role) return message.reply('Please mention a role.');
-      whitelist[guild.id].roles[sub === 'add' ? 'add' : 'delete'](role.id);
-      return message.reply(`${role.name} ${sub === 'add' ? 'added to' : 'removed from'} whitelist.`);
+      whitelist[guild.id].roles[sub==='add'?'add':'delete'](role.id);
+      return message.reply(`${role.name} ${sub==='add'?'added to':'removed from'} whitelist.`);
     }
   }
 
-  // =====================
-  // +say — whitelist only, sends as bot
-  // =====================
+  // ── +say ───────────────────────────────
   if (command === 'say') {
-    if (!isAdmin && !isServerOwner && !whitelisted) {
-      return message.reply('Only whitelisted users or admins can use this command.');
-    }
+    if (!isAdmin && !isServerOwner && !whitelisted) return message.reply('Only whitelisted users or admins can use this.');
     const targetChannel = message.mentions.channels.first();
     if (!targetChannel) return message.reply('Mention a channel. Example: `+say #general Hello!`');
-    const content    = message.content.replace(`${PREFIX}say`, '').replace(`<#${targetChannel.id}>`, '').trim();
+    const content = message.content.replace(`${PREFIX}say`,'').replace(`<#${targetChannel.id}>`,'').trim();
     const attachment = message.attachments.first();
-    if (!content && !attachment) return message.reply('Provide a message or image to send.');
-
+    if (!content && !attachment) return message.reply('Provide a message or image.');
     try {
       const webhooks = await targetChannel.fetchWebhooks();
       let webhook = webhooks.find(w => w.name === 'Avia');
-      if (!webhook) {
-        webhook = await targetChannel.createWebhook({
-          name: 'Avia',
-          avatar: client.user.displayAvatarURL(),
-        });
-      }
+      if (!webhook) webhook = await targetChannel.createWebhook({ name: 'Avia', avatar: client.user.displayAvatarURL() });
       const wc = new WebhookClient({ id: webhook.id, token: webhook.token });
-      await wc.send({
-        content:   content || undefined,
-        files:     attachment ? [attachment.url] : [],
-        username:  client.user.username,           // always the bot name
-        avatarURL: client.user.displayAvatarURL(), // always the bot avatar
-      });
+      await wc.send({ content: content||undefined, files: attachment?[attachment.url]:[], username: client.user.username, avatarURL: client.user.displayAvatarURL() });
       await message.delete().catch(() => {});
-    } catch (e) {
-      console.error('Webhook error:', e.message);
-      message.reply('Failed to send. Make sure I have Manage Webhooks permission in that channel.');
-    }
+    } catch (e) { console.error('Webhook error:', e.message); message.reply('Failed. Make sure I have Manage Webhooks permission.'); }
     return;
   }
 
-  // =====================
-  // +clear [amount] — bulk delete (14-day window)
-  // =====================
+  // ── +dmall ─────────────────────────────
+  if (command === 'dmall') {
+    if (!isServerOwner && !isAdmin) return message.reply('Only the server owner or admins can use this.');
+    const content = args.join(' ');
+    if (!content) return message.reply('Provide a message.');
+    const attachment = message.attachments.first();
+    await message.reply('Starting DM broadcast...');
+    await guild.members.fetch();
+    const humans = guild.members.cache.filter(m => !m.user.bot);
+    let sent = 0, failed = 0;
+    const embed = bw(`Message from ${guild.name}`).setDescription(content).setThumbnail(guild.iconURL()).setFooter({ text: `Sent by ${guild.name}` }).setTimestamp();
+    for (const [, m] of humans) {
+      try { await m.send({ embeds: [embed], files: attachment?[attachment.url]:[] }); sent++; } catch { failed++; }
+      await new Promise(r => setTimeout(r, 800));
+    }
+    await message.channel.send(`DM broadcast complete. Sent: ${sent} — Failed: ${failed}`);
+    await sendLog(guild, bw('DM Broadcast').addFields(
+      { name: 'By', value: message.author.tag, inline: true },
+      { name: 'Sent', value: `${sent}`, inline: true },
+      { name: 'Failed', value: `${failed}`, inline: true },
+      { name: 'Message', value: content.slice(0,300) },
+    ).setTimestamp());
+    return;
+  }
+
+  // ── +setuplogs ─────────────────────────
+  if (command === 'setuplogs') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+    const existing = getLogChannel(guild);
+    if (existing) return message.reply(`Logs channel already exists: <#${existing.id}>`);
+    try {
+      const created = await guild.channels.create({
+        name: 'logs', reason: 'Bot log channel setup',
+        permissionOverwrites: [{ id: guild.roles.everyone, deny: [PermissionsBitField.Flags.SendMessages] }],
+      });
+      return message.reply(`Logs channel created: <#${created.id}>`);
+    } catch { return message.reply('Failed. Make sure I have Manage Channels permission.'); }
+  }
+
+  // ── +setupverify ───────────────────────
+  if (command === 'setupverify') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+    const targetChannel = message.mentions.channels.first();
+    const role          = message.mentions.roles.first();
+    if (!targetChannel || !role) return message.reply('Usage: `+setupverify #channel @role`');
+    try {
+      const banner = new AttachmentBuilder(BANNER_PATH, { name: 'banner.png' });
+      const row    = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('verify_button').setLabel('Verify').setStyle(ButtonStyle.Secondary)
+      );
+      await targetChannel.send({
+        files: [banner],
+        embeds: [
+          bw(`Verify — ${guild.name}`)
+            .setImage('attachment://banner.png')
+            .setDescription('Press the button below to verify and gain access to the server.')
+            .setFooter({ text: 'You will only need to do this once.' })
+        ],
+        components: [row],
+      });
+      // Save persistently so restarts don't break it
+      verifyConfig[guild.id] = { roleId: role.id };
+      saveVerify();
+      return message.reply(`Verification set up in <#${targetChannel.id}>. Role to assign: **${role.name}**.`);
+    } catch (e) {
+      console.error('Setupverify error:', e.message);
+      return message.reply('Failed to send verify panel. Check my permissions in that channel.');
+    }
+  }
+
+  // ── +setuptickets ──────────────────────
+  if (command === 'setuptickets') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+    const panelChannel = message.mentions.channels.first();
+    const roles        = [...message.mentions.roles.values()];
+    const supportRole  = roles[0];
+    const closeRole    = roles[1];
+    if (!panelChannel || !supportRole || !closeRole) {
+      return message.reply('Usage: `+setuptickets #channel @support-role @close-role`');
+    }
+    try {
+      const banner = new AttachmentBuilder(BANNER_PATH, { name: 'banner.png' });
+      const row    = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ticket_open').setLabel('Open Ticket').setStyle(ButtonStyle.Secondary)
+      );
+      await panelChannel.send({
+        files: [banner],
+        embeds: [
+          bw('Support')
+            .setImage('attachment://banner.png')
+            .setDescription('Press the button below to open a support ticket.\nA staff member will assist you shortly.')
+            .addFields(
+              { name: 'Support', value: `<@&${supportRole.id}>`, inline: true },
+              { name: 'Close',   value: `<@&${closeRole.id}>`,   inline: true },
+            )
+            .setFooter({ text: 'One ticket per user at a time.' })
+            .setTimestamp()
+        ],
+        components: [row],
+      });
+      // Save persistently
+      ticketConfig[guild.id] = { supportRoleId: supportRole.id, closeRoleId: closeRole.id, categoryId: null, panelChannelId: panelChannel.id };
+      saveTicket();
+      return message.reply(`Ticket panel created in <#${panelChannel.id}>.\nSupport: **${supportRole.name}** — Close: **${closeRole.name}**`);
+    } catch (e) {
+      console.error('Ticket setup error:', e.message);
+      return message.reply('Failed. Check my permissions in that channel.');
+    }
+  }
+
+  // ── +closeticket ───────────────────────
+  if (command === 'closeticket') {
+    if (!isAdmin) return message.reply('You need Administrator to use this.');
+    const ticket = openTickets[message.channelId];
+    if (!ticket) return message.reply('This is not an active ticket channel.');
+    await message.channel.send('Closing in 5 seconds...');
+    await sendLog(guild, bw('Ticket Force Closed').addFields(
+      { name: 'Closed by', value: `${message.author.tag}`,        inline: true },
+      { name: 'Channel',   value: `#${message.channel.name}`,     inline: true },
+    ).setTimestamp());
+    delete openTickets[message.channelId];
+    setTimeout(() => message.channel.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  // ── +clear ─────────────────────────────
   if (command === 'clear') {
     if (!isMod && !isAdmin) return message.reply('You need Manage Messages to use this.');
     const amount = parseInt(args[0]);
     if (isNaN(amount) || amount < 1 || amount > 100) return message.reply('Provide a number between 1 and 100.');
     await message.delete().catch(() => {});
     const fetched   = await message.channel.messages.fetch({ limit: amount });
-    const twoWeeks  = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const twoWeeks  = Date.now() - 14*24*60*60*1000;
     const deletable = fetched.filter(m => m.createdTimestamp > twoWeeks);
     if (deletable.size === 0) {
-      const w = await message.channel.send('No messages in the 14-day window. Use `+clearall` to delete all messages regardless of date.');
+      const w = await message.channel.send('No messages in 14-day window. Use `+clearall` for older messages.');
       return setTimeout(() => w.delete().catch(() => {}), 5000);
     }
     await message.channel.bulkDelete(deletable, true).catch(console.error);
-    const confirm = await message.channel.send(`Deleted ${deletable.size} message(s).`);
-    setTimeout(() => confirm.delete().catch(() => {}), 3000);
+    const c = await message.channel.send(`Deleted ${deletable.size} message(s).`);
+    setTimeout(() => c.delete().catch(() => {}), 3000);
+    return;
   }
 
-  // =====================
-  // +clearall — deletes every message in the channel, any age
-  // =====================
+  // ── +clearall ──────────────────────────
   if (command === 'clearall') {
     if (!isAdmin) return message.reply('You need Administrator to use this.');
     await message.delete().catch(() => {});
-    const notice = await message.channel.send('Clearing all messages. This may take a while...');
-    let deleted   = 0;
-    let keepGoing = true;
-
+    const notice = await message.channel.send('Clearing all messages...');
+    let deleted = 0, keepGoing = true;
     while (keepGoing) {
       const fetched = await message.channel.messages.fetch({ limit: 100 }).catch(() => null);
       if (!fetched || fetched.size === 0) break;
-
-      const recent  = fetched.filter(m => m.id !== notice.id && Date.now() - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
-      const old     = fetched.filter(m => m.id !== notice.id && Date.now() - m.createdTimestamp >= 14 * 24 * 60 * 60 * 1000);
-
-      if (recent.size > 0) {
-        await message.channel.bulkDelete(recent, true).catch(() => {});
-        deleted += recent.size;
-      }
-      for (const [, msg] of old) {
-        await msg.delete().catch(() => {});
-        deleted++;
-        await new Promise(r => setTimeout(r, 350)); // stay within rate limits
-      }
+      const recent = fetched.filter(m => m.id !== notice.id && Date.now()-m.createdTimestamp < 14*24*60*60*1000);
+      const old    = fetched.filter(m => m.id !== notice.id && Date.now()-m.createdTimestamp >= 14*24*60*60*1000);
+      if (recent.size > 0) { await message.channel.bulkDelete(recent, true).catch(() => {}); deleted += recent.size; }
+      for (const [, msg] of old) { await msg.delete().catch(() => {}); deleted++; await new Promise(r => setTimeout(r, 350)); }
       if (fetched.size < 100) keepGoing = false;
     }
-
     await notice.delete().catch(() => {});
-    const confirm = await message.channel.send(`Cleared ${deleted} message(s).`);
-    setTimeout(() => confirm.delete().catch(() => {}), 4000);
+    const c = await message.channel.send(`Cleared ${deleted} message(s).`);
+    setTimeout(() => c.delete().catch(() => {}), 4000);
+    return;
   }
 
-  // =====================
-  // +hide #channel — hide a channel from @everyone
-  // +hide #channel @role — hide from everyone except a specific role
-  // =====================
+  // ── +hide ──────────────────────────────
   if (command === 'hide') {
     if (!isAdmin) return message.reply('You need Administrator to use this.');
-
-    const target   = message.mentions.channels.first();
-    const role     = message.mentions.roles.first();
-    const everyone = guild.roles.everyone;
-
+    const target = message.mentions.channels.first();
+    const role   = message.mentions.roles.first();
     if (!target) return message.reply('Mention a channel. Example: `+hide #channel` or `+hide #channel @role`');
-
     try {
-      const overwrites = [{ id: everyone, deny: [PermissionsBitField.Flags.ViewChannel] }];
-
-      // If a role is specified, allow that role to still see it
-      if (role) {
-        overwrites.push({ id: role, allow: [PermissionsBitField.Flags.ViewChannel] });
-      }
-
+      const overwrites = [{ id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] }];
+      if (role) overwrites.push({ id: role, allow: [PermissionsBitField.Flags.ViewChannel] });
       await target.permissionOverwrites.set(overwrites);
-
-      const msg = role
-        ? `<#${target.id}> is now hidden from @everyone. Only **${role.name}** can see it.`
-        : `<#${target.id}> is now hidden from @everyone.`;
-
-      const done = await message.channel.send(msg);
+      const done = await message.channel.send(role ? `<#${target.id}> hidden. Only **${role.name}** can see it.` : `<#${target.id}> hidden from @everyone.`);
       setTimeout(() => done.delete().catch(() => {}), 6000);
       await message.delete().catch(() => {});
-
-      await sendLog(guild, bwEmbed('Channel Hidden')
-        .addFields(
-          { name: 'By',             value: message.author.tag,                    inline: true },
-          { name: 'Channel',        value: `#${target.name}`,                     inline: true },
-          { name: 'Visible to',     value: role ? role.name : 'Nobody (admins only)', inline: true },
-        ).setTimestamp());
-    } catch (e) {
-      console.error('Hide error:', e.message);
-      message.reply('Failed to hide that channel. Make sure I have Manage Channels permission and my role is high enough.');
-    }
+      await sendLog(guild, bw('Channel Hidden').addFields(
+        { name: 'By', value: message.author.tag, inline: true },
+        { name: 'Channel', value: `#${target.name}`, inline: true },
+        { name: 'Visible to', value: role ? role.name : 'Nobody (admins only)', inline: true },
+      ).setTimestamp());
+    } catch { message.reply('Failed. Make sure I have Manage Channels permission and my role is high enough.'); }
     return;
   }
 
-  // =====================
-  // +unhide #channel — restore a channel back to visible for @everyone
-  // =====================
+  // ── +unhide ────────────────────────────
   if (command === 'unhide') {
     if (!isAdmin) return message.reply('You need Administrator to use this.');
-
-    const target   = message.mentions.channels.first();
-    const everyone = guild.roles.everyone;
-
+    const target = message.mentions.channels.first();
     if (!target) return message.reply('Mention a channel. Example: `+unhide #channel`');
-
     try {
-      await target.permissionOverwrites.edit(everyone, { ViewChannel: true });
-
-      const done = await message.channel.send(`<#${target.id}> is now visible to @everyone again.`);
+      await target.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: true });
+      const done = await message.channel.send(`<#${target.id}> is now visible to @everyone.`);
       setTimeout(() => done.delete().catch(() => {}), 6000);
       await message.delete().catch(() => {});
-
-      await sendLog(guild, bwEmbed('Channel Unhidden')
-        .addFields(
-          { name: 'By',      value: message.author.tag, inline: true },
-          { name: 'Channel', value: `#${target.name}`,  inline: true },
-        ).setTimestamp());
-    } catch (e) {
-      console.error('Unhide error:', e.message);
-      message.reply('Failed to unhide that channel. Make sure I have Manage Channels permission.');
-    }
+      await sendLog(guild, bw('Channel Unhidden').addFields(
+        { name: 'By', value: message.author.tag, inline: true },
+        { name: 'Channel', value: `#${target.name}`, inline: true },
+      ).setTimestamp());
+    } catch { message.reply('Failed. Make sure I have Manage Channels permission.'); }
     return;
   }
-
 });
 
-// =====================
+// ─────────────────────────────────────────
 // Login
-// =====================
+// ─────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN);
