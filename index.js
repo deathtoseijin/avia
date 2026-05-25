@@ -339,9 +339,6 @@ client.on('messageCreate', async message => {
       return;
     }
   }
-  const isMod         = message.member?.permissions.has(PermissionsBitField.Flags.ManageMessages);
-  const isServerOwner = isOwner(message.member);
-  const whitelisted   = isWhitelisted(message.member);
 
   // ---- Malicious content ----
   if (!isAdmin && !isMod && !whitelisted && MALICIOUS_REGEX.test(message.content)) {
