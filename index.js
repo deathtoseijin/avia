@@ -791,9 +791,9 @@ client.on('messageCreate', async message => {
     const panelChannel = message.mentions.channels.first();
     const roles        = [...message.mentions.roles.values()];
     const supportRole  = roles[0];
-    const closeRole    = roles[1];
-    if (!panelChannel || !supportRole || !closeRole) {
-      return message.reply('Usage: `+setuptickets #channel @support-role @close-role`');
+    const closeRole    = roles[1] || roles[0]; // allow same role for both if only one mentioned
+    if (!panelChannel || !supportRole) {
+      return message.reply('Usage: `+setuptickets #channel @support-role @close-role`\nTip: you can use the same role twice if you want one role to handle everything.');
     }
     try {
       const banner = new AttachmentBuilder(BANNER_PATH, { name: 'banner.png' });
