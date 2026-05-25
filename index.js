@@ -397,7 +397,7 @@ client.on('messageCreate', async message => {
           { name: 'Whitelist — Owner/Admin',
             value: '`+whitelist add/remove user @user`\n`+whitelist add/remove role @role`\n`+whitelist list`' },
           { name: 'Announce — Whitelist only',
-            value: '`+say #channel Your message` — sends as bot. Attach image if needed.' },
+            value: '`+say #channel Your message` — sends as bot. Attach image if needed.\n`+dmall Your message` — DMs every member (Owner/Admin only)' },
           { name: 'Setup — Admin only',
             value: '`+setuplogs` — creates #logs channel\n`+setupverify #channel @role` — sets up verify button' },
         ).setTimestamp()
@@ -519,6 +519,67 @@ client.on('messageCreate', async message => {
         .setFooter({ text: 'Run +countdown again to refresh' })
         .setTimestamp()
     ]});
+  }
+
+  // =====================
+  // +dmall <message> — DM every human member in the server
+  // Owner/Admin only
+  // =====================
+  if (command === 'dmall') {
+    if (!isServerOwner && !isAdmin) {
+      return message.reply('Only the server owner or admins can use this command.');
+    }
+
+    const content = args.join(' ');
+    if (!content) return message.reply('Provide a message. Example: `+dmall Hello everyone!`');
+
+    // Confirm first to avoid accidental mass DMs
+    const attachment = message.attachments.first();
+
+    await message.reply('Starting DM broadcast. This may take a while...');
+
+    // Fetch all members
+    await guild.members.fetch();
+    const humans = guild.members.cache.filter(m => !m.user.bot);
+
+    let sent    = 0;
+    let failed  = 0;
+
+    const embed = new EmbedBuilder()
+      .setColor(0x000000)
+      .setTitle(`Message from ${guild.name}`)
+      .setDescription(content)
+      .setThumbnail(guild.iconURL())
+      .setFooter({ text: `Sent by ${guild.name}` })
+      .setTimestamp();
+
+    for (const [, member] of humans) {
+      try {
+        await member.send({
+          embeds: [embed],
+          files: attachment ? [attachment.url] : [],
+        });
+        sent++;
+      } catch (e) {
+        failed++; // user has DMs disabled or blocked the bot
+      }
+      // Small delay to avoid hitting Discord rate limits
+      await new Promise(r => setTimeout(r, 800));
+    }
+
+    const summary = await message.channel.send(
+      `DM broadcast complete.\n**Sent:** ${sent}\n**Failed:** ${failed} (users with DMs disabled)`
+    );
+
+    await sendLog(guild, bwEmbed('DM Broadcast Sent')
+      .addFields(
+        { name: 'By',      value: message.author.tag, inline: true },
+        { name: 'Sent',    value: `${sent}`,           inline: true },
+        { name: 'Failed',  value: `${failed}`,         inline: true },
+        { name: 'Message', value: content.slice(0, 300) },
+      ).setTimestamp());
+
+    return;
   }
 
   // =====================
