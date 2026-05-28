@@ -392,51 +392,118 @@ client.on('messageCreate', async message => {
   const isServerOwner = isOwner(message.member);
   const whitelisted   = isWhitelisted(message.member);
 
-  // ── Repeated spam ──────────────────────
+  // ── Advanced Spam Detection ────────────
   if (!isAdmin && !isMod && !whitelisted) {
-    const uid     = message.author.id;
-    const content = message.content.trim().toLowerCase();
-    if (!userSpamTracker[guild.id][uid]) {
-      userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
-    }
-    const tracker = userSpamTracker[guild.id][uid];
-    if (content && content === tracker.content) {
-      tracker.count++;
-      tracker.messageIds.push(message.id);
-    } else {
-      tracker.content    = content;
-      tracker.count      = 1;
-      tracker.messageIds = [message.id];
-    }
-    if (tracker.timer) clearTimeout(tracker.timer);
-    tracker.timer = setTimeout(() => {
-      if (userSpamTracker[guild.id]) userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
-    }, 10000);
+    const uid = message.author.id;
 
-    if (tracker.count >= 5) {
-      for (const id of tracker.messageIds.slice(-5)) {
-        await message.channel.messages.fetch(id).then(m => m.delete().catch(() => {})).catch(() => {});
-      }
-      if (!warnings[guild.id][uid]) warnings[guild.id][uid] = 0;
-      warnings[guild.id][uid]++;
-      userSpamTracker[guild.id][uid] = { content: '', count: 0, timer: null, messageIds: [] };
+    // Timeout durations per warning count
+    // warning 1 = 30 min, 2 = 1 hr, 3+ = 1 day
+    const TIMEOUT_DURATIONS = [0, 30 * 60 * 1000, 60 * 60 * 1000, 24 * 60 * 60 * 1000];
+    const TIMEOUT_LABELS    = ['', '30 minutes', '1 hour', '1 day'];
 
-      if (warnings[guild.id][uid] === 1) {
-        const w = await message.channel.send(`${message.author.username}, stop spamming. Messages deleted. Next offence results in a kick.`);
-        setTimeout(() => w.delete().catch(() => {}), 8000);
-        await sendLog(guild, bw('Spam Warning').addFields(
-          { name: 'User',    value: `${message.author.tag}`,    inline: true },
-          { name: 'Channel', value: `#${message.channel.name}`, inline: true },
-        ).setTimestamp());
-      } else {
-        if (message.member.kickable) {
-          await message.member.kick('Repeated spam after warning');
-          warnings[guild.id][uid] = 0;
-          await sendLog(guild, bw('Member Kicked — Spam').addFields(
-            { name: 'User', value: `${message.author.tag}`, inline: true },
-          ).setTimestamp());
+    async function applySpamAction(reason, deleteCount = 0) {
+      // Delete recent messages
+      if (deleteCount > 0) {
+        const fetched = await message.channel.messages.fetch({ limit: deleteCount + 1 }).catch(() => null);
+        if (fetched) {
+          const toDelete = fetched.filter(m => m.author.id === uid);
+          for (const [, m] of toDelete) await m.delete().catch(() => {});
         }
       }
+
+      if (!warnings[guild.id][uid]) warnings[guild.id][uid] = 0;
+      warnings[guild.id][uid]++;
+      const warnCount = warnings[guild.id][uid];
+
+      // Reset tracker
+      userSpamTracker[guild.id][uid] = { messages: [], rateMsgs: [], timer: null };
+
+      const duration = TIMEOUT_DURATIONS[Math.min(warnCount, 3)];
+      const label    = TIMEOUT_LABELS[Math.min(warnCount, 3)];
+
+      // Apply timeout
+      try {
+        await message.member.disableCommunicationUntil(
+          Date.now() + duration,
+          `Spam: ${reason} (warning ${warnCount})`
+        );
+      } catch (e) {
+        console.error('Timeout error:', e.message);
+      }
+
+      const notice = await message.channel.send(
+        `${message.author.username}, you have been timed out for **${label}**. Reason: ${reason}. Warning ${warnCount}/3.`
+      );
+      setTimeout(() => notice.delete().catch(() => {}), 10000);
+
+      await sendLog(guild, bw('Spam Timeout')
+        .addFields(
+          { name: 'User',     value: `${message.author.tag}`,    inline: true },
+          { name: 'Channel',  value: `#${message.channel.name}`, inline: true },
+          { name: 'Reason',   value: reason,                     inline: true },
+          { name: 'Duration', value: label,                      inline: true },
+          { name: 'Warning',  value: `${warnCount}/3`,           inline: true },
+        ).setTimestamp());
+    }
+
+    // Init tracker
+    if (!userSpamTracker[guild.id][uid]) {
+      userSpamTracker[guild.id][uid] = { messages: [], rateMsgs: [], timer: null };
+    }
+    const tracker = userSpamTracker[guild.id][uid];
+
+    const now     = Date.now();
+    const content = message.content.trim();
+
+    // Track all messages for rate spam (sliding 5s window)
+    tracker.rateMsgs.push(now);
+    tracker.rateMsgs = tracker.rateMsgs.filter(t => now - t < 5000);
+
+    // Reset inactivity timer
+    if (tracker.timer) clearTimeout(tracker.timer);
+    tracker.timer = setTimeout(() => {
+      if (userSpamTracker[guild.id]) {
+        userSpamTracker[guild.id][uid] = { messages: [], rateMsgs: [], timer: null };
+      }
+    }, 10000);
+
+    // ── 1. Rate spam — 6+ different messages in 5 seconds
+    if (tracker.rateMsgs.length >= 6) {
+      await applySpamAction('Sending messages too rapidly', 6);
+      return;
+    }
+
+    // ── 2. Repeated identical messages — 5 in a row
+    tracker.messages.push(content);
+    if (tracker.messages.length > 5) tracker.messages.shift();
+    if (tracker.messages.length === 5 && tracker.messages.every(m => m === tracker.messages[0])) {
+      await applySpamAction('Repeated identical messages', 5);
+      return;
+    }
+
+    // ── 3. Mass mentions — 4+ unique mentions in one message
+    const mentionCount = (message.mentions.users.size || 0) + (message.mentions.roles.size || 0);
+    if (mentionCount >= 4) {
+      await message.delete().catch(() => {});
+      await applySpamAction(`Mass mentions (${mentionCount} mentions in one message)`, 0);
+      return;
+    }
+
+    // ── 4. Excessive caps — 70%+ caps in messages over 10 chars
+    if (content.length > 10) {
+      const letters  = content.replace(/[^a-zA-Z]/g, '');
+      const capsRate = letters.length > 0 ? (content.replace(/[^A-Z]/g, '').length / letters.length) : 0;
+      if (capsRate >= 0.7) {
+        await message.delete().catch(() => {});
+        await applySpamAction('Excessive caps', 0);
+        return;
+      }
+    }
+
+    // ── 5. Repeated characters — e.g. AAAAAAA (7+ same chars in a row)
+    if (/(.)\1{6,}/.test(content)) {
+      await message.delete().catch(() => {});
+      await applySpamAction('Repeated characters', 0);
       return;
     }
   }
